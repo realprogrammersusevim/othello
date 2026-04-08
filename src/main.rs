@@ -1,7 +1,7 @@
 use rayon::prelude::*;
+use std::cell::UnsafeCell;
 use std::io::{self, stdin, stdout, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -140,7 +140,7 @@ fn find_valid_moves(board: &Board, player: SquareState) -> Vec<(usize, usize)> {
             if board[i][j] != SquareState::Empty {
                 continue;
             }
-            for x in -1..=1 {
+            'cell: for x in -1..=1 {
                 for y in -1..=1 {
                     if x == 0 && y == 0 {
                         continue;
@@ -155,6 +155,7 @@ fn find_valid_moves(board: &Board, player: SquareState) -> Vec<(usize, usize)> {
                         } else if board[n as usize][m as usize] == player {
                             if found_opponent {
                                 moves.push((j, i));
+                                break 'cell;
                             }
                             break;
                         } else {
@@ -262,7 +263,10 @@ fn init_zobrist() -> ZobristTable {
             }
         }
     }
-    ZobristTable { pieces, black_to_move: next(&mut s) }
+    ZobristTable {
+        pieces,
+        black_to_move: next(&mut s),
+    }
 }
 
 fn compute_hash(board: &Board, player: SquareState) -> u64 {
@@ -306,7 +310,14 @@ struct TTEntry {
 
 impl Default for TTEntry {
     fn default() -> Self {
-        TTEntry { key: 0, score: 0, flag: TT_NONE, depth: 0, best_x: 255, best_y: 255 }
+        TTEntry {
+            key: 0,
+            score: 0,
+            flag: TT_NONE,
+            depth: 0,
+            best_x: 255,
+            best_y: 255,
+        }
     }
 }
 
@@ -323,20 +334,33 @@ impl TranspositionTable {
     fn new(size: usize) -> Self {
         assert!(size.is_power_of_two());
         TranspositionTable {
-            data: (0..size).map(|_| UnsafeCell::new(TTEntry::default())).collect(),
+            data: (0..size)
+                .map(|_| UnsafeCell::new(TTEntry::default()))
+                .collect(),
             mask: size - 1,
         }
     }
 
     fn probe(&self, hash: u64) -> Option<TTEntry> {
         let entry = unsafe { *self.data[hash as usize & self.mask].get() };
-        if entry.flag != TT_NONE && entry.key == hash { Some(entry) } else { None }
+        if entry.flag != TT_NONE && entry.key == hash {
+            Some(entry)
+        } else {
+            None
+        }
     }
 
     fn store(&self, hash: u64, depth: u8, score: i32, flag: u8, best: Option<(usize, usize)>) {
         let slot = unsafe { &mut *self.data[hash as usize & self.mask].get() };
         let (bx, by) = best.map_or((255u8, 255u8), |(x, y)| (x as u8, y as u8));
-        *slot = TTEntry { key: hash, score, flag, depth, best_x: bx, best_y: by };
+        *slot = TTEntry {
+            key: hash,
+            score,
+            flag,
+            depth,
+            best_x: bx,
+            best_y: by,
+        };
     }
 }
 
@@ -344,27 +368,31 @@ static TT: OnceLock<TranspositionTable> = OnceLock::new();
 
 // ---------- Evaluation ----------
 
-fn positional_score(board: &Board, player: SquareState) -> i32 {
-    let mut score = 0;
+fn evaluate(board: &Board, player: SquareState) -> i32 {
+    let opp = opposite(player);
+    let mut player_pieces = 0i32;
+    let mut opp_pieces = 0i32;
+    let mut player_pos = 0i32;
+    let mut opp_pos = 0i32;
+    let mut player_frontier = 0i32;
+    let mut opp_frontier = 0i32;
+
+    // Single pass: piece counts, positional scores, and frontier discs
     for i in 0..BOARD_SIZE {
         for j in 0..BOARD_SIZE {
-            if board[i][j] == player {
-                score += POSITION_WEIGHTS[i][j];
-            }
-        }
-    }
-    score
-}
-
-/// Count discs that have at least one empty neighbour (exposed / unstable frontier).
-fn frontier_discs(board: &Board, player: SquareState) -> i32 {
-    let mut count = 0;
-    'cell: for i in 0..BOARD_SIZE {
-        for j in 0..BOARD_SIZE {
-            if board[i][j] != player {
+            let sq = board[i][j];
+            if sq == SquareState::Empty {
                 continue;
             }
-            for di in -1i32..=1 {
+            let is_player = sq == player;
+            if is_player {
+                player_pieces += 1;
+                player_pos += POSITION_WEIGHTS[i][j];
+            } else {
+                opp_pieces += 1;
+                opp_pos += POSITION_WEIGHTS[i][j];
+            }
+            'nb: for di in -1i32..=1 {
                 for dj in -1i32..=1 {
                     if di == 0 && dj == 0 {
                         continue;
@@ -377,20 +405,18 @@ fn frontier_discs(board: &Board, player: SquareState) -> i32 {
                         && nj < BOARD_SIZE as i32
                         && board[ni as usize][nj as usize] == SquareState::Empty
                     {
-                        count += 1;
-                        continue 'cell;
+                        if is_player {
+                            player_frontier += 1;
+                        } else {
+                            opp_frontier += 1;
+                        }
+                        break 'nb;
                     }
                 }
             }
         }
     }
-    count
-}
 
-fn evaluate(board: &Board, player: SquareState) -> i32 {
-    let opp = opposite(player);
-    let player_pieces = count_pieces(board, player);
-    let opp_pieces = count_pieces(board, opp);
     let empty = (BOARD_SIZE * BOARD_SIZE) as i32 - player_pieces - opp_pieces;
 
     // Endgame: exact piece count dominates — scaled large to beat any heuristic value
@@ -398,15 +424,15 @@ fn evaluate(board: &Board, player: SquareState) -> i32 {
         return (player_pieces - opp_pieces) * 500;
     }
 
-    let pos = positional_score(board, player) - positional_score(board, opp);
+    let pos = player_pos - opp_pos;
 
     // Mobility: having more moves available is a strategic advantage
     let player_moves = find_valid_moves(board, player).len() as i32;
     let opp_moves = find_valid_moves(board, opp).len() as i32;
     let mobility = player_moves - opp_moves;
 
-    // Frontier: fewer exposed discs = more stable position (negate the difference)
-    let frontier = frontier_discs(board, player) - frontier_discs(board, opp);
+    // Frontier: fewer exposed discs = more stable position
+    let frontier = player_frontier - opp_frontier;
 
     pos + mobility * 10 - frontier * 3
 }
@@ -548,8 +574,8 @@ fn negamax(
             tt.store(hash, 255, score, TT_EXACT, None);
             return score;
         }
-        // forced pass
-        return -negamax(board, opposite(player), depth - 1, -beta, -alpha, abort, tt);
+        // forced pass — position didn't advance, so don't decrement depth
+        return -negamax(board, opposite(player), depth, -beta, -alpha, abort, tt);
     }
 
     // TT hash move first, then positional weights
