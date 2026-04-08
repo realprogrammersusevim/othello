@@ -201,7 +201,7 @@ fn render_board(board: &Board) {
     io::stdout().flush().unwrap();
 }
 
-const MAX_DEPTH: usize = 5;
+const MAX_DEPTH: usize = 14;
 
 fn opposite(player: SquareState) -> SquareState {
     match player {
@@ -211,85 +211,94 @@ fn opposite(player: SquareState) -> SquareState {
     }
 }
 
+// Higher = better move to try first; improves alpha-beta cut rate
+fn move_priority(mov: (usize, usize)) -> i32 {
+    let (x, y) = mov;
+    if (x == 0 || x == 7) && (y == 0 || y == 7) {
+        return 3; // corner
+    }
+    if (x == 1 || x == 6) && (y == 1 || y == 6) {
+        return -2; // X-square — adjacent to corner, usually bad
+    }
+    if x == 0 || x == 7 || y == 0 || y == 7 {
+        return 1; // edge
+    }
+    0
+}
+
 fn find_best_move(
     board: &Board,
     player: SquareState,
-    moves: Vec<(usize, usize)>,
+    mut moves: Vec<(usize, usize)>,
 ) -> (usize, usize) {
-    let best_score = Arc::new(Mutex::new(i32::MIN));
-    let best_move = Arc::new(Mutex::new(moves[0]));
+    moves.sort_by_key(|&m| -move_priority(m));
 
-    moves.par_iter().for_each(|&mov| {
-        let score = score_move(board, player, player, mov, MAX_DEPTH);
-
-        let mut best_score_guard = best_score.lock().unwrap();
-        let mut best_move_guard = best_move.lock().unwrap();
-
-        if score > *best_score_guard {
-            *best_score_guard = score;
-            *best_move_guard = mov;
-        }
-    });
-
-    let result = *best_move.lock().unwrap();
-    result
+    // Parallel over top-level moves; each thread runs its own alpha-beta subtree
+    moves
+        .par_iter()
+        .map(|&mov| {
+            let mut b = board.to_owned();
+            update_board(&mut b, mov.0, mov.1, player);
+            let score = -negamax(&b, opposite(player), MAX_DEPTH - 1, i32::MIN + 1, i32::MAX);
+            (mov, score)
+        })
+        .max_by_key(|t| t.1)
+        .map(|t| t.0)
+        .unwrap_or(moves[0])
 }
 
-fn score_move(
-    board: &Board,
-    current_turn: SquareState,
-    ai_player: SquareState,
-    next_move: (usize, usize),
-    depth: usize,
-) -> i32 {
-    let mut board_copy = board.to_owned();
-    update_board(&mut board_copy, next_move.0, next_move.1, current_turn);
-
+fn negamax(board: &Board, player: SquareState, depth: usize, alpha: i32, beta: i32) -> i32 {
     if depth == 0 {
-        return count_pieces(&board_copy, ai_player) as i32
-            - count_pieces(&board_copy, opposite(ai_player)) as i32;
+        return count_pieces(board, player) as i32 - count_pieces(board, opposite(player)) as i32;
     }
 
-    let next_turn = opposite(current_turn);
-    let next_moves = find_valid_moves(&board_copy, next_turn);
-
-    if next_moves.is_empty() {
-        // next_turn must pass; check if current_turn can continue
-        let same_moves = find_valid_moves(&board_copy, current_turn);
-        if same_moves.is_empty() {
+    let mut moves = find_valid_moves(board, player);
+    if moves.is_empty() {
+        let opp_moves = find_valid_moves(board, opposite(player));
+        if opp_moves.is_empty() {
             // game over
-            return count_pieces(&board_copy, ai_player) as i32
-                - count_pieces(&board_copy, opposite(ai_player)) as i32;
+            return count_pieces(board, player) as i32
+                - count_pieces(board, opposite(player)) as i32;
         }
-        // current_turn plays again
-        if current_turn == ai_player {
-            return same_moves
-                .iter()
-                .map(|&m| score_move(&board_copy, current_turn, ai_player, m, depth - 1))
-                .max()
-                .unwrap_or(0);
-        } else {
-            return same_moves
-                .iter()
-                .map(|&m| score_move(&board_copy, current_turn, ai_player, m, depth - 1))
-                .min()
-                .unwrap_or(0);
-        }
+        // forced pass
+        return -negamax(board, opposite(player), depth - 1, -beta, -alpha);
     }
 
-    if next_turn == ai_player {
-        next_moves
-            .iter()
-            .map(|&m| score_move(&board_copy, next_turn, ai_player, m, depth - 1))
+    moves.sort_by_key(|&m| -move_priority(m));
+
+    // Second parallel level: fans out ~moves² tasks so all cores stay busy.
+    // Alpha-beta can't be shared across threads, so we use a full window here;
+    // sequential alpha-beta takes over one level below.
+    if depth >= MAX_DEPTH - 1 {
+        return moves
+            .par_iter()
+            .map(|&mov| {
+                let mut b = board.to_owned();
+                update_board(&mut b, mov.0, mov.1, player);
+                -negamax(&b, opposite(player), depth - 1, i32::MIN + 1, i32::MAX)
+            })
             .max()
-            .unwrap_or(0)
-    } else {
-        next_moves
-            .iter()
-            .map(|&m| score_move(&board_copy, next_turn, ai_player, m, depth - 1))
-            .min()
-            .unwrap_or(0)
+            .unwrap_or(i32::MIN + 1);
     }
+
+    // Sequential alpha-beta for the rest of the tree
+    let mut alpha = alpha;
+    let mut best = i32::MIN + 1;
+    for mov in moves {
+        let mut b = board.to_owned();
+        update_board(&mut b, mov.0, mov.1, player);
+        let score = -negamax(&b, opposite(player), depth - 1, -beta, -alpha);
+        if score > best {
+            best = score;
+        }
+        if score > alpha {
+            alpha = score;
+        }
+        if alpha >= beta {
+            break; // beta cut-off
+        }
+    }
+    best
 }
 
 fn get_user_move(moves: &[(usize, usize)]) -> Option<(usize, usize)> {
