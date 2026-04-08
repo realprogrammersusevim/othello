@@ -1,8 +1,10 @@
 use rayon::prelude::*;
 use std::io::{self, stdin, stdout, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::cell::UnsafeCell;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::OnceLock;
+use std::time::Duration;
 use termion::event::{Event, Key};
 use termion::input::TermRead;
 use termion::raw::IntoRawMode;
@@ -50,17 +52,24 @@ fn main() {
         }
         consecutive_passes = 0;
 
-        let next_move: (usize, usize) = match current_player {
-            SquareState::White => match get_user_move(&moves[..]) {
-                Some(m) => m,
-                None => return,
-            },
+        let (next_move, ai_depth) = match current_player {
+            SquareState::White => (
+                match get_user_move(&moves[..]) {
+                    Some(m) => m,
+                    None => return,
+                },
+                0,
+            ),
             SquareState::Black => find_best_move(&board, current_player, moves.clone()),
-            SquareState::Empty => (0, 0),
+            SquareState::Empty => ((0, 0), 0),
         };
 
         update_board(&mut board, next_move.0, next_move.1, current_player);
         render_board(&board);
+        if current_player == SquareState::Black && ai_depth > 0 {
+            print!("AI searched to depth {ai_depth}\r\n");
+            io::stdout().flush().unwrap();
+        }
 
         current_player = match current_player {
             SquareState::White => SquareState::Black,
@@ -202,7 +211,7 @@ fn render_board(board: &Board) {
 // Safety cap on search depth — the time limit will nearly always trigger first
 const MAX_DEPTH: usize = 60;
 
-const TIME_LIMIT: Duration = Duration::from_secs(2);
+const TIME_LIMIT: Duration = Duration::from_secs(10);
 
 // Endgame threshold: switch to exact piece-count when this many squares remain empty
 const ENDGAME_EMPTY: i32 = 12;
@@ -226,6 +235,114 @@ fn opposite(player: SquareState) -> SquareState {
         SquareState::Empty => SquareState::Empty,
     }
 }
+
+// ---------- Zobrist hashing ----------
+
+struct ZobristTable {
+    pieces: [[[u64; 3]; BOARD_SIZE]; BOARD_SIZE],
+    black_to_move: u64,
+}
+
+static ZOBRIST: OnceLock<ZobristTable> = OnceLock::new();
+
+fn init_zobrist() -> ZobristTable {
+    let mut s: u64 = 0xcafef00d_deadbeef;
+    let next = |s: &mut u64| -> u64 {
+        *s = s.wrapping_add(0x9e3779b97f4a7c15);
+        let mut x = *s;
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+        x ^ (x >> 31)
+    };
+    let mut pieces = [[[0u64; 3]; BOARD_SIZE]; BOARD_SIZE];
+    for row in pieces.iter_mut() {
+        for cell in row.iter_mut() {
+            for slot in cell.iter_mut() {
+                *slot = next(&mut s);
+            }
+        }
+    }
+    ZobristTable { pieces, black_to_move: next(&mut s) }
+}
+
+fn compute_hash(board: &Board, player: SquareState) -> u64 {
+    let zt = ZOBRIST.get_or_init(init_zobrist);
+    let mut hash: u64 = 0;
+    for i in 0..BOARD_SIZE {
+        for j in 0..BOARD_SIZE {
+            let k = match board[i][j] {
+                SquareState::Empty => 0,
+                SquareState::White => 1,
+                SquareState::Black => 2,
+            };
+            hash ^= zt.pieces[i][j][k];
+        }
+    }
+    if player == SquareState::Black {
+        hash ^= zt.black_to_move;
+    }
+    hash
+}
+
+// ---------- Transposition table ----------
+
+const TT_SIZE: usize = 1 << 20; // ~1M entries, ~16 MB
+
+const TT_NONE: u8 = 0;
+const TT_EXACT: u8 = 1;
+const TT_LOWER: u8 = 2; // fail-high: score >= beta
+const TT_UPPER: u8 = 3; // fail-low:  score <= alpha
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct TTEntry {
+    key: u64,
+    score: i32,
+    flag: u8,
+    depth: u8,
+    best_x: u8, // 255 = no move stored
+    best_y: u8,
+}
+
+impl Default for TTEntry {
+    fn default() -> Self {
+        TTEntry { key: 0, score: 0, flag: TT_NONE, depth: 0, best_x: 255, best_y: 255 }
+    }
+}
+
+struct TranspositionTable {
+    data: Vec<UnsafeCell<TTEntry>>,
+    mask: usize,
+}
+
+// Lockless TT: races cause benign torn reads/writes caught by the key check.
+unsafe impl Sync for TranspositionTable {}
+unsafe impl Send for TranspositionTable {}
+
+impl TranspositionTable {
+    fn new(size: usize) -> Self {
+        assert!(size.is_power_of_two());
+        TranspositionTable {
+            data: (0..size).map(|_| UnsafeCell::new(TTEntry::default())).collect(),
+            mask: size - 1,
+        }
+    }
+
+    fn probe(&self, hash: u64) -> Option<TTEntry> {
+        let entry = unsafe { *self.data[hash as usize & self.mask].get() };
+        if entry.flag != TT_NONE && entry.key == hash { Some(entry) } else { None }
+    }
+
+    fn store(&self, hash: u64, depth: u8, score: i32, flag: u8, best: Option<(usize, usize)>) {
+        let slot = unsafe { &mut *self.data[hash as usize & self.mask].get() };
+        let (bx, by) = best.map_or((255u8, 255u8), |(x, y)| (x as u8, y as u8));
+        *slot = TTEntry { key: hash, score, flag, depth, best_x: bx, best_y: by };
+    }
+}
+
+static TT: OnceLock<TranspositionTable> = OnceLock::new();
+
+// ---------- Evaluation ----------
 
 fn positional_score(board: &Board, player: SquareState) -> i32 {
     let mut score = 0;
@@ -303,7 +420,7 @@ fn find_best_move(
     board: &Board,
     player: SquareState,
     mut moves: Vec<(usize, usize)>,
-) -> (usize, usize) {
+) -> ((usize, usize), usize) {
     moves.sort_by_key(|&m| -move_priority(m));
 
     let abort = Arc::new(AtomicBool::new(false));
@@ -316,10 +433,11 @@ fn find_best_move(
     });
 
     let mut best_move = moves[0];
+    let mut completed_depth = 0usize;
     // Tracks move order; re-sorted after each depth using scores from the previous
     // search (principal-variation ordering — improves alpha-beta cut rate at the next depth)
     let mut ordered = moves.clone();
-    let start = Instant::now();
+    let tt = TT.get_or_init(|| TranspositionTable::new(TT_SIZE));
 
     for depth in 1..=MAX_DEPTH {
         if abort.load(Ordering::Relaxed) {
@@ -339,6 +457,7 @@ fn find_best_move(
                     i32::MIN + 1,
                     i32::MAX,
                     abort_ref,
+                    tt,
                 );
                 (mov.0, mov.1, score)
             })
@@ -352,6 +471,7 @@ fn find_best_move(
         if let Some(&(x, y, _)) = results.iter().max_by_key(|&&(_, _, s)| s) {
             best_move = (x, y);
         }
+        completed_depth = depth;
 
         // Re-order moves by descending score for the next depth
         ordered.sort_by_key(|&mov| {
@@ -365,11 +485,9 @@ fn find_best_move(
         if results.iter().any(|&(_, _, s)| s.abs() >= 5_000) {
             break;
         }
-
-        let _ = start; // suppress unused warning; kept for future time-budget logging
     }
 
-    best_move
+    (best_move, completed_depth)
 }
 
 fn negamax(
@@ -379,13 +497,45 @@ fn negamax(
     alpha: i32,
     beta: i32,
     abort: &AtomicBool,
+    tt: &TranspositionTable,
 ) -> i32 {
     if abort.load(Ordering::Relaxed) {
         return 0; // value will be discarded by find_best_move
     }
 
+    let hash = compute_hash(board, player);
+    let orig_alpha = alpha;
+    let mut alpha = alpha;
+    let mut tt_best: Option<(usize, usize)> = None;
+
+    if let Some(entry) = tt.probe(hash) {
+        if entry.best_x < BOARD_SIZE as u8 {
+            tt_best = Some((entry.best_x as usize, entry.best_y as usize));
+        }
+        if entry.depth >= depth as u8 {
+            let s = entry.score;
+            match entry.flag {
+                TT_EXACT => return s,
+                TT_LOWER => {
+                    if s >= beta {
+                        return s;
+                    }
+                    alpha = alpha.max(s);
+                }
+                TT_UPPER => {
+                    if s <= alpha {
+                        return s;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     if depth == 0 {
-        return evaluate(board, player);
+        let score = evaluate(board, player);
+        tt.store(hash, 0, score, TT_EXACT, None);
+        return score;
     }
 
     let mut moves = find_valid_moves(board, player);
@@ -393,22 +543,36 @@ fn negamax(
         let opp_moves = find_valid_moves(board, opposite(player));
         if opp_moves.is_empty() {
             // game over — exact result, scaled to dominate any heuristic score
-            return (count_pieces(board, player) - count_pieces(board, opposite(player))) * 10_000;
+            let score =
+                (count_pieces(board, player) - count_pieces(board, opposite(player))) * 10_000;
+            tt.store(hash, 255, score, TT_EXACT, None);
+            return score;
         }
         // forced pass
-        return -negamax(board, opposite(player), depth - 1, -beta, -alpha, abort);
+        return -negamax(board, opposite(player), depth - 1, -beta, -alpha, abort, tt);
     }
 
-    moves.sort_by_key(|&m| -move_priority(m));
+    // TT hash move first, then positional weights
+    moves.sort_by_key(|&m| {
+        if Some(m) == tt_best {
+            i32::MIN
+        } else {
+            -move_priority(m)
+        }
+    });
 
-    let mut alpha = alpha;
     let mut best = i32::MIN + 1;
-    for mov in moves {
+    let mut best_move = moves[0];
+    for &mov in &moves {
         let mut b = board.to_owned();
         update_board(&mut b, mov.0, mov.1, player);
-        let score = -negamax(&b, opposite(player), depth - 1, -beta, -alpha, abort);
+        let score = -negamax(&b, opposite(player), depth - 1, -beta, -alpha, abort, tt);
+        if abort.load(Ordering::Relaxed) {
+            return 0; // don't store aborted results
+        }
         if score > best {
             best = score;
+            best_move = mov;
         }
         if score > alpha {
             alpha = score;
@@ -417,6 +581,16 @@ fn negamax(
             break; // beta cut-off
         }
     }
+
+    let flag = if best >= beta {
+        TT_LOWER
+    } else if best > orig_alpha {
+        TT_EXACT
+    } else {
+        TT_UPPER
+    };
+    tt.store(hash, depth as u8, best, flag, Some(best_move));
+
     best
 }
 
