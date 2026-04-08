@@ -41,7 +41,7 @@ fn main() {
             current_player = match current_player {
                 SquareState::White => SquareState::Black,
                 SquareState::Black => SquareState::White,
-                _ => SquareState::Empty,
+                SquareState::Empty => SquareState::Empty,
             };
             continue;
         }
@@ -53,7 +53,7 @@ fn main() {
                 None => return,
             },
             SquareState::Black => find_best_move(&board, current_player, moves.clone()),
-            _ => (0, 0),
+            SquareState::Empty => (0, 0),
         };
 
         update_board(&mut board, next_move.0, next_move.1, current_player);
@@ -62,26 +62,20 @@ fn main() {
         current_player = match current_player {
             SquareState::White => SquareState::Black,
             SquareState::Black => SquareState::White,
-            _ => SquareState::Empty,
+            SquareState::Empty => SquareState::Empty,
         }
     }
 
     let white = count_pieces(&board, SquareState::White);
     let black = count_pieces(&board, SquareState::Black);
-    if white > black {
-        print!("White wins with {} pieces!\r\n", white);
-    } else {
-        match black > white {
-            true => {
-                print!("Black wins with {} pieces!\r\n", black);
-            }
-            false => {
-                print!("Draw!\r\n");
-            }
-        }
+    match white.cmp(&black) {
+        std::cmp::Ordering::Greater => print!("White wins with {white} pieces!\r\n"),
+        std::cmp::Ordering::Less => print!("Black wins with {black} pieces!\r\n"),
+        std::cmp::Ordering::Equal => print!("Draw!\r\n"),
     }
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn update_board(board: &mut Board, x: usize, y: usize, player: SquareState) {
     board[y][x] = player;
     let mut k: usize;
@@ -120,12 +114,13 @@ fn update_board(board: &mut Board, x: usize, y: usize, player: SquareState) {
     }
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn find_valid_moves(board: &Board, player: SquareState) -> Vec<(usize, usize)> {
     let mut moves: Vec<(usize, usize)> = Vec::new();
     let opponent = match player {
         SquareState::White => SquareState::Black,
         SquareState::Black => SquareState::White,
-        _ => SquareState::Empty,
+        SquareState::Empty => SquareState::Empty,
     };
 
     for i in 0..BOARD_SIZE {
@@ -164,12 +159,12 @@ fn find_valid_moves(board: &Board, player: SquareState) -> Vec<(usize, usize)> {
     moves
 }
 
-fn count_pieces(board: &Board, player: SquareState) -> usize {
+fn count_pieces(board: &Board, player: SquareState) -> i32 {
     let mut player_count = 0;
 
     (0..BOARD_SIZE).for_each(|i| {
-        for j in 0..BOARD_SIZE {
-            if board[i][j] == player {
+        for sq in &board[i] {
+            if *sq == player {
                 player_count += 1;
             }
         }
@@ -185,16 +180,16 @@ fn render_board(board: &Board) {
     print!("  0 1 2 3 4 5 6 7\r\n");
     (0..BOARD_SIZE).for_each(|i| {
         print!("{}", termion::clear::CurrentLine);
-        print!("{} ", i);
-        for j in 0..BOARD_SIZE {
-            let symbol = match board[i][j] {
+        print!("{i} ");
+        for sq in &board[i] {
+            let symbol = match sq {
                 SquareState::White => "\u{25cf} ", // black piece
                 SquareState::Black => "\u{25cb} ", // white piece
                 SquareState::Empty => "\u{00b7} ", // empty cell
             };
-            print!("{}", symbol);
+            print!("{symbol}");
         }
-        print!("{}\r\n", i);
+        print!("{i}\r\n");
     });
     print!("{}", termion::clear::CurrentLine);
     print!("  0 1 2 3 4 5 6 7\r\n");
@@ -207,7 +202,7 @@ fn opposite(player: SquareState) -> SquareState {
     match player {
         SquareState::White => SquareState::Black,
         SquareState::Black => SquareState::White,
-        _ => SquareState::Empty,
+        SquareState::Empty => SquareState::Empty,
     }
 }
 
@@ -243,13 +238,12 @@ fn find_best_move(
             (mov, score)
         })
         .max_by_key(|t| t.1)
-        .map(|t| t.0)
-        .unwrap_or(moves[0])
+        .map_or(moves[0], |t| t.0)
 }
 
 fn negamax(board: &Board, player: SquareState, depth: usize, alpha: i32, beta: i32) -> i32 {
     if depth == 0 {
-        return count_pieces(board, player) as i32 - count_pieces(board, opposite(player)) as i32;
+        return count_pieces(board, player) - count_pieces(board, opposite(player));
     }
 
     let mut moves = find_valid_moves(board, player);
@@ -257,8 +251,7 @@ fn negamax(board: &Board, player: SquareState, depth: usize, alpha: i32, beta: i
         let opp_moves = find_valid_moves(board, opposite(player));
         if opp_moves.is_empty() {
             // game over
-            return count_pieces(board, player) as i32
-                - count_pieces(board, opposite(player)) as i32;
+            return count_pieces(board, player) - count_pieces(board, opposite(player));
         }
         // forced pass
         return -negamax(board, opposite(player), depth - 1, -beta, -alpha);
