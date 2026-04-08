@@ -1,6 +1,5 @@
 use rayon::prelude::*;
 use std::io::{self, stdin, stdout, Write};
-use std::sync::{Arc, Mutex};
 use termion::event::{Event, Key};
 use termion::input::TermRead;
 use termion::raw::IntoRawMode;
@@ -18,7 +17,7 @@ type Board = [[SquareState; BOARD_SIZE]; BOARD_SIZE];
 
 fn main() {
     print!("{}", termion::clear::All);
-    stdout().into_raw_mode().unwrap();
+    let _raw = stdout().into_raw_mode().unwrap();
 
     let mut board: Board = [[SquareState::Empty; BOARD_SIZE]; BOARD_SIZE];
 
@@ -28,13 +27,31 @@ fn main() {
     board[4][3] = SquareState::Black;
     board[4][4] = SquareState::White;
 
-    update_board(&mut board, 2, 3, SquareState::Black);
     render_board(&board);
     let mut current_player = SquareState::White;
+    let mut consecutive_passes = 0;
     for _ in 1..60 {
         let moves = find_valid_moves(&board, current_player);
+
+        if moves.is_empty() {
+            consecutive_passes += 1;
+            if consecutive_passes >= 2 {
+                break;
+            }
+            current_player = match current_player {
+                SquareState::White => SquareState::Black,
+                SquareState::Black => SquareState::White,
+                _ => SquareState::Empty,
+            };
+            continue;
+        }
+        consecutive_passes = 0;
+
         let next_move: (usize, usize) = match current_player {
-            SquareState::White => get_user_move(moves),
+            SquareState::White => match get_user_move(&moves[..]) {
+                Some(m) => m,
+                None => return,
+            },
             SquareState::Black => find_best_move(&board, current_player, moves.clone()),
             _ => (0, 0),
         };
@@ -52,14 +69,14 @@ fn main() {
     let white = count_pieces(&board, SquareState::White);
     let black = count_pieces(&board, SquareState::Black);
     if white > black {
-        println!("White wins with {} pieces!", white);
+        print!("White wins with {} pieces!\r\n", white);
     } else {
         match black > white {
             true => {
-                println!("Black wins with {} pieces!", black);
+                print!("Black wins with {} pieces!\r\n", black);
             }
             false => {
-                println!("Draw!");
+                print!("Draw!\r\n");
             }
         }
     }
@@ -165,7 +182,7 @@ fn render_board(board: &Board) {
     print!("{}", termion::clear::All);
     print!("{}", termion::cursor::Goto(1, 1));
     print!("{}", termion::clear::CurrentLine);
-    println!("  0 1 2 3 4 5 6 7");
+    print!("  0 1 2 3 4 5 6 7\r\n");
     (0..BOARD_SIZE).for_each(|i| {
         print!("{}", termion::clear::CurrentLine);
         print!("{} ", i);
@@ -177,33 +194,33 @@ fn render_board(board: &Board) {
             };
             print!("{}", symbol);
         }
-        println!("{}", i);
+        print!("{}\r\n", i);
     });
     print!("{}", termion::clear::CurrentLine);
-    println!("  0 1 2 3 4 5 6 7");
+    print!("  0 1 2 3 4 5 6 7\r\n");
     io::stdout().flush().unwrap();
 }
 
-const MAX_DEPTH: usize = 12;
+const MAX_DEPTH: usize = 5;
+
+fn opposite(player: SquareState) -> SquareState {
+    match player {
+        SquareState::White => SquareState::Black,
+        SquareState::Black => SquareState::White,
+        _ => SquareState::Empty,
+    }
+}
 
 fn find_best_move(
     board: &Board,
     player: SquareState,
     moves: Vec<(usize, usize)>,
 ) -> (usize, usize) {
-    // TODO: implement alpha-beta search pruning so we can avoid spending time on
-    // bad branches and search the good branches deeper.
     let best_score = Arc::new(Mutex::new(i32::MIN));
     let best_move = Arc::new(Mutex::new(moves[0]));
 
     moves.par_iter().for_each(|&mov| {
-        let score = score_move(
-            board,
-            player,
-            mov,
-            MAX_DEPTH,
-            &mut best_score.lock().unwrap().clone(),
-        );
+        let score = score_move(board, player, player, mov, MAX_DEPTH);
 
         let mut best_score_guard = best_score.lock().unwrap();
         let mut best_move_guard = best_move.lock().unwrap();
@@ -214,80 +231,91 @@ fn find_best_move(
         }
     });
 
-    let x = *best_move.lock().unwrap();
-    x
+    let result = *best_move.lock().unwrap();
+    result
 }
 
 fn score_move(
     board: &Board,
-    player: SquareState,
+    current_turn: SquareState,
+    ai_player: SquareState,
     next_move: (usize, usize),
     depth: usize,
-    best_score: &mut i32,
 ) -> i32 {
-    if depth == 0 {
-        return count_pieces(board, player) as i32;
-    }
-
     let mut board_copy = board.to_owned();
-    update_board(&mut board_copy, next_move.0, next_move.1, player);
-    let next_valid_moves = find_valid_moves(&board_copy, player);
+    update_board(&mut board_copy, next_move.0, next_move.1, current_turn);
 
-    let mut current_score = 0;
-    for next_next_move in next_valid_moves {
-        current_score += score_move(&board_copy, player, next_next_move, depth - 1, best_score);
+    if depth == 0 {
+        return count_pieces(&board_copy, ai_player) as i32
+            - count_pieces(&board_copy, opposite(ai_player)) as i32;
     }
 
-    if depth == MAX_DEPTH && current_score > *best_score {
-        *best_score = current_score;
-        return current_score;
+    let next_turn = opposite(current_turn);
+    let next_moves = find_valid_moves(&board_copy, next_turn);
+
+    if next_moves.is_empty() {
+        // next_turn must pass; check if current_turn can continue
+        let same_moves = find_valid_moves(&board_copy, current_turn);
+        if same_moves.is_empty() {
+            // game over
+            return count_pieces(&board_copy, ai_player) as i32
+                - count_pieces(&board_copy, opposite(ai_player)) as i32;
+        }
+        // current_turn plays again
+        if current_turn == ai_player {
+            return same_moves
+                .iter()
+                .map(|&m| score_move(&board_copy, current_turn, ai_player, m, depth - 1))
+                .max()
+                .unwrap_or(0);
+        } else {
+            return same_moves
+                .iter()
+                .map(|&m| score_move(&board_copy, current_turn, ai_player, m, depth - 1))
+                .min()
+                .unwrap_or(0);
+        }
     }
 
-    current_score
+    if next_turn == ai_player {
+        next_moves
+            .iter()
+            .map(|&m| score_move(&board_copy, next_turn, ai_player, m, depth - 1))
+            .max()
+            .unwrap_or(0)
+    } else {
+        next_moves
+            .iter()
+            .map(|&m| score_move(&board_copy, next_turn, ai_player, m, depth - 1))
+            .min()
+            .unwrap_or(0)
+    }
 }
 
-fn get_user_move(moves: Vec<(usize, usize)>) -> (usize, usize) {
-    let labels = vec![
-        "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "q", "w", "e", "r", "t", "y", "u", "i",
-        "o", "p", "a", "s", "d", "f",
+fn get_user_move(moves: &[(usize, usize)]) -> Option<(usize, usize)> {
+    let labels = [
+        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i',
+        'o', 'p', 'a', 's', 'd', 'f',
     ];
 
-    for i in 0..moves.len() {
+    for (i, mov) in moves.iter().enumerate().take(labels.len()) {
         print!("{}", termion::clear::CurrentLine);
-        println!("{}: ({}, {})  ", labels[i], moves[i].0, moves[i].1);
+        print!("{}: ({}, {})  \r\n", labels[i], mov.0, mov.1);
     }
     stdout().flush().unwrap();
 
     loop {
         for event in stdin().events() {
-            if let Event::Key(key) = event.unwrap() {
-                match key {
-                    Key::Char('0') => return moves[0],
-                    Key::Char('1') => return moves[1],
-                    Key::Char('2') => return moves[2],
-                    Key::Char('3') => return moves[3],
-                    Key::Char('4') => return moves[4],
-                    Key::Char('5') => return moves[5],
-                    Key::Char('6') => return moves[6],
-                    Key::Char('7') => return moves[7],
-                    Key::Char('8') => return moves[8],
-                    Key::Char('9') => return moves[9],
-                    Key::Char('q') => return moves[10],
-                    Key::Char('w') => return moves[11],
-                    Key::Char('e') => return moves[12],
-                    Key::Char('r') => return moves[13],
-                    Key::Char('t') => return moves[14],
-                    Key::Char('y') => return moves[15],
-                    Key::Char('u') => return moves[16],
-                    Key::Char('i') => return moves[17],
-                    Key::Char('o') => return moves[18],
-                    Key::Char('p') => return moves[19],
-                    Key::Char('a') => return moves[20],
-                    Key::Char('s') => return moves[21],
-                    Key::Char('d') => return moves[22],
-                    Key::Char('f') => return moves[23],
-                    _ => continue,
+            let Ok(event) = event else { continue };
+            if let Event::Key(Key::Char(c)) = event {
+                if let Some(idx) = labels.iter().position(|&l| l == c) {
+                    if idx < moves.len() {
+                        return Some(moves[idx]);
+                    }
                 }
+            }
+            if let Event::Key(Key::Ctrl('c')) = event {
+                return None;
             }
         }
     }
