@@ -197,15 +197,15 @@ const MAX_DEPTH: usize = 60;
 const ENDGAME_EMPTY: i32 = 12;
 
 #[rustfmt::skip]
-const POSITION_WEIGHTS: [[i32; BOARD_SIZE]; BOARD_SIZE] = [
-    [100, -20,  10,  5,  5,  10, -20, 100],
-    [-20, -40,  -5, -5, -5,  -5, -40, -20],
-    [ 10,  -5,  15,  3,  3,  15,  -5,  10],
-    [  5,  -5,   3,  3,  3,   3,  -5,   5],
-    [  5,  -5,   3,  3,  3,   3,  -5,   5],
-    [ 10,  -5,  15,  3,  3,  15,  -5,  10],
-    [-20, -40,  -5, -5, -5,  -5, -40, -20],
-    [100, -20,  10,  5,  5,  10, -20, 100],
+const POSITION_WEIGHTS: [i32; 64] = [
+    100, -20,  10,  5,  5,  10, -20, 100,
+    -20, -40,  -5, -5, -5,  -5, -40, -20,
+     10,  -5,  15,  3,  3,  15,  -5,  10,
+      5,  -5,   3,  3,  3,   3,  -5,   5,
+      5,  -5,   3,  3,  3,   3,  -5,   5,
+     10,  -5,  15,  3,  3,  15,  -5,  10,
+    -20, -40,  -5, -5, -5,  -5, -40, -20,
+    100, -20,  10,  5,  5,  10, -20, 100,
 ];
 
 pub fn opposite(player: SquareState) -> SquareState {
@@ -358,13 +358,13 @@ pub fn evaluate(board: &Board, player: SquareState) -> i32 {
     let mut b = p_board;
     while b != 0 {
         let i = b.trailing_zeros() as usize;
-        p_pos += POSITION_WEIGHTS[i / 8][i % 8];
+        p_pos += POSITION_WEIGHTS[i];
         b &= b - 1;
     }
     let mut b = o_board;
     while b != 0 {
         let i = b.trailing_zeros() as usize;
-        o_pos += POSITION_WEIGHTS[i / 8][i % 8];
+        o_pos += POSITION_WEIGHTS[i];
         b &= b - 1;
     }
 
@@ -399,7 +399,7 @@ fn count_frontier(board: u64, empty: u64) -> i32 {
 }
 
 fn move_priority(bit_idx: u8) -> i32 {
-    POSITION_WEIGHTS[bit_idx as usize / 8][bit_idx as usize % 8]
+    POSITION_WEIGHTS[bit_idx as usize]
 }
 
 pub fn find_best_move(
@@ -537,13 +537,16 @@ pub fn negamax(
         return -negamax(board, opposite(player), depth, -beta, -alpha, abort, tt);
     }
 
-    let mut moves: Vec<u8> = Vec::new();
+    let mut moves = [0u8; 64];
+    let mut move_count = 0usize;
     let mut b = moves_mask;
     while b != 0 {
-        moves.push(b.trailing_zeros() as u8);
+        moves[move_count] = b.trailing_zeros() as u8;
+        move_count += 1;
         b &= b - 1;
     }
-    moves.sort_by_key(|&m| {
+    let moves = &mut moves[..move_count];
+    moves.sort_unstable_by_key(|&m| {
         if Some(m) == tt_best {
             i32::MIN
         } else {
@@ -553,7 +556,7 @@ pub fn negamax(
 
     let mut best = i32::MIN + 1;
     let mut best_move = moves[0];
-    for &m in &moves {
+    for &m in moves.iter() {
         let mut b = board.to_owned();
         update_board(&mut b, m, player);
         let score = -negamax(&b, opposite(player), depth - 1, -beta, -alpha, abort, tt);

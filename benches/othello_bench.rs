@@ -27,20 +27,23 @@ fn bench_othello(c: &mut Criterion) {
     });
 
     // Benchmark search performance for a fixed depth (better for performance comparison)
-    let tt = TranspositionTable::new(1024); // Small TT for benchmark
     let abort = AtomicBool::new(false);
     c.bench_function("negamax_depth_6", |b| {
-        b.iter(|| {
-            negamax(
-                black_box(&board),
-                black_box(SquareState::White),
-                black_box(6),
-                black_box(i32::MIN + 1),
-                black_box(i32::MAX),
-                black_box(&abort),
-                black_box(&tt),
-            )
-        })
+        b.iter_batched(
+            || TranspositionTable::new(1 << 20),
+            |tt| {
+                negamax(
+                    black_box(&board),
+                    black_box(SquareState::White),
+                    6,
+                    i32::MIN + 1,
+                    i32::MAX,
+                    &abort,
+                    &tt,
+                )
+            },
+            criterion::BatchSize::LargeInput,
+        )
     });
 
     // Overall search for 100ms
@@ -49,14 +52,14 @@ fn bench_othello(c: &mut Criterion) {
     update_board(&mut mid_game_board, 18, SquareState::Black);
     update_board(&mut mid_game_board, 20, SquareState::White);
 
-    c.bench_function("find_best_move_100ms", |b| {
+    c.bench_function("find_best_move_10ms", |b| {
         let moves = find_valid_moves(&mid_game_board, SquareState::Black);
         b.iter(|| {
             find_best_move(
                 black_box(&mid_game_board),
                 black_box(SquareState::Black),
                 black_box(moves.clone()),
-                black_box(Duration::from_millis(100)),
+                black_box(Duration::from_millis(10)),
             )
         })
     });
