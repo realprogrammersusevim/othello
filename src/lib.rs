@@ -236,6 +236,9 @@ pub fn render_board(board: &Board) {
     print!("{}", termion::clear::All);
     print!("{}", termion::cursor::Goto(1, 1));
     print!("{}", termion::clear::CurrentLine);
+    let white = count_pieces(board, SquareState::White);
+    let black = count_pieces(board, SquareState::Black);
+    print!("\u{25cf} White: {white}  \u{25cb} Black: {black}\r\n");
     print!("  0 1 2 3 4 5 6 7\r\n");
     for i in 0..BOARD_SIZE {
         print!("{}", termion::clear::CurrentLine);
@@ -486,10 +489,10 @@ impl Engine {
         board: &Board,
         player: Player,
         time_limit: Duration,
-    ) -> ((usize, usize), usize) {
+    ) -> ((usize, usize), usize, i32) {
         let moves_mask = board.valid_moves(player);
         if moves_mask.is_empty() {
-            return ((0, 0), 0);
+            return ((0, 0), 0, 0);
         }
 
         let abort = Arc::new(AtomicBool::new(false));
@@ -504,6 +507,7 @@ impl Engine {
 
         let mut best_move_idx = ordered[0];
         let mut completed_depth = 0usize;
+        let mut best_score = 0i32;
 
         for depth in 1..=MAX_DEPTH {
             if abort.load(Ordering::Relaxed) {
@@ -529,8 +533,9 @@ impl Engine {
             if abort.load(Ordering::Relaxed) {
                 break;
             }
-            if let Some(&(m, _)) = results.iter().max_by_key(|&&(_, s)| s) {
+            if let Some(&(m, s)) = results.iter().max_by_key(|&&(_, s)| s) {
                 best_move_idx = m;
+                best_score = s;
             }
             completed_depth = depth;
             ordered.sort_by_key(|&m| {
@@ -546,6 +551,7 @@ impl Engine {
         (
             (best_move_idx as usize % 8, best_move_idx as usize / 8),
             completed_depth,
+            best_score,
         )
     }
 
@@ -1385,7 +1391,7 @@ mod tests {
         let engine = Engine::new();
         let board = Board::new();
         let valid = moves_set(&board, Player::BLACK);
-        let (mv, depth) = engine.find_best_move(&board, Player::BLACK, Duration::from_millis(200));
+        let (mv, depth, _score) = engine.find_best_move(&board, Player::BLACK, Duration::from_millis(200));
         assert!(valid.contains(&mv), "best move {mv:?} must be a valid move");
         assert!(depth > 0, "should complete at least depth 1");
     }

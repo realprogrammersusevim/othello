@@ -29,9 +29,9 @@ fn main() {
         }
         consecutive_passes = 0;
 
-        let (next_move, ai_depth) = if current_player == Player::WHITE {
+        let (next_move, ai_depth, ai_score) = if current_player == Player::WHITE {
             match get_user_move(&moves[..]) {
-                Some(m) => (m, 0),
+                Some(m) => (m, 0, 0),
                 None => return,
             }
         } else {
@@ -41,7 +41,14 @@ fn main() {
         board = board.make_move((next_move.1 * 8 + next_move.0) as u8, current_player);
         render_board(&board);
         if current_player == Player::BLACK && ai_depth > 0 {
-            print!("AI searched to depth {ai_depth}\r\n");
+            let eval_str = if ai_score > 500 {
+                "Black is winning".to_string()
+            } else if ai_score < -500 {
+                "White is winning".to_string()
+            } else {
+                "Position is roughly equal".to_string()
+            };
+            print!("AI searched to depth {ai_depth} | Eval: {ai_score} ({eval_str})\r\n");
             io::stdout().flush().unwrap();
         }
 
