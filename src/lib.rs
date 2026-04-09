@@ -154,14 +154,14 @@ const A_FILE: u64 = 0x0101010101010101;
 const H_FILE: u64 = 0x8080808080808080;
 
 const DIRS: [(i8, u64); 8] = [
-    (1, !A_FILE),   // Right
-    (-1, !H_FILE),  // Left
-    (8, !0u64),     // Down
-    (-8, !0u64),    // Up
-    (7, !H_FILE),   // DownLeft
-    (-7, !A_FILE),  // UpRight
-    (9, !A_FILE),   // DownRight
-    (-9, !H_FILE),  // UpLeft
+    (1, !A_FILE),  // Right
+    (-1, !H_FILE), // Left
+    (8, !0u64),    // Down
+    (-8, !0u64),   // Up
+    (7, !H_FILE),  // DownLeft
+    (-7, !A_FILE), // UpRight
+    (9, !A_FILE),  // DownRight
+    (-9, !H_FILE), // UpLeft
 ];
 
 fn get_moves(player: u64, opponent: u64) -> u64 {
@@ -193,14 +193,16 @@ fn get_flips(player: u64, opponent: u64, move_bit: u64) -> u64 {
         if candidates == 0 {
             continue;
         }
-        let mut current_ray = candidates;
+        let mut frontier = candidates;
+        let mut ray = candidates;
         for _ in 0..6 {
-            let next = shift_mask(current_ray, shift, mask);
+            let next = shift_mask(frontier, shift, mask);
             if (next & opponent) != 0 {
-                current_ray |= next;
+                frontier = next;
+                ray |= frontier;
             } else {
                 if (next & player) != 0 {
-                    flips |= current_ray;
+                    flips |= ray;
                 }
                 break;
             }
@@ -648,7 +650,8 @@ impl Engine {
         } else {
             TT_UPPER
         };
-        self.tt.store(hash, depth as u8, best, flag, Some(best_move));
+        self.tt
+            .store(hash, depth as u8, best, flag, Some(best_move));
         best
     }
 }
