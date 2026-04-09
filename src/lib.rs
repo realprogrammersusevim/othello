@@ -8,7 +8,43 @@ use std::time::Duration;
 use termion::event::{Event, Key};
 use termion::input::TermRead;
 
-pub const BOARD_SIZE: usize = 8;
+#[derive(Copy, Clone, PartialEq, Debug, Default)]
+pub struct Board {
+    pub black: u64,
+    pub white: u64,
+}
+
+impl Board {
+    pub fn new() -> Self {
+        let mut board = Board::default();
+        // Initial state
+        board.white |= (1 << 27) | (1 << 36);
+        board.black |= (1 << 28) | (1 << 35);
+        board
+    }
+
+    pub fn get(&self, x: usize, y: usize) -> SquareState {
+        let bit = 1 << (y * 8 + x);
+        if (self.black & bit) != 0 {
+            SquareState::Black
+        } else if (self.white & bit) != 0 {
+            SquareState::White
+        } else {
+            SquareState::Empty
+        }
+    }
+
+    pub fn set(&mut self, x: usize, y: usize, player: SquareState) {
+        let bit = 1 << (y * 8 + x);
+        self.black &= !bit;
+        self.white &= !bit;
+        match player {
+            SquareState::Black => self.black |= bit,
+            SquareState::White => self.white |= bit,
+            SquareState::Empty => {}
+        }
+    }
+}
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum SquareState {
@@ -17,105 +53,121 @@ pub enum SquareState {
     Black,
 }
 
-pub type Board = [[SquareState; BOARD_SIZE]; BOARD_SIZE];
+const A_FILE: u64 = 0x0101010101010101;
+const H_FILE: u64 = 0x8080808080808080;
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-pub fn update_board(board: &mut Board, x: usize, y: usize, player: SquareState) {
-    board[y][x] = player;
-    let mut k: usize;
-    let mut l: usize;
-    let mut n: i8;
-    let mut m: i8;
+fn get_moves(player: u64, opponent: u64) -> u64 {
+    let empty = !(player | opponent);
+    let mut moves = 0u64;
 
-    for i in -1..=1 {
-        for j in -1..=1 {
-            if i == 0 && j == 0 {
-                continue;
-            }
-            n = i;
-            m = j;
-            k = y;
-            l = x;
-            loop {
-                k = (k as i8 + n) as usize;
-                l = (l as i8 + m) as usize;
-                if k > 7 || l > 7 {
-                    break;
-                }
-                if board[k][l] == player {
-                    while k != y || l != x {
-                        k = (k as i8 - n) as usize;
-                        l = (l as i8 - m) as usize;
-                        board[k][l] = player;
-                    }
-                    break;
-                }
-                if board[k][l] == SquareState::Empty {
-                    break;
-                }
-            }
+    let dirs: [(i8, u64); 8] = [
+        (1, !A_FILE),  // Right
+        (-1, !H_FILE), // Left
+        (8, !0),       // Down
+        (-8, !0),      // Up
+        (7, !H_FILE),  // DownLeft
+        (-7, !A_FILE), // UpRight
+        (9, !A_FILE),  // DownRight
+        (-9, !H_FILE), // UpLeft
+    ];
+
+    for (shift, mask) in dirs {
+        let mut candidates = shift_mask(player, shift, mask) & opponent;
+        for _ in 0..5 {
+            candidates |= shift_mask(candidates, shift, mask) & opponent;
         }
-    }
-}
-
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-pub fn find_valid_moves(board: &Board, player: SquareState) -> Vec<(usize, usize)> {
-    let mut moves: Vec<(usize, usize)> = Vec::new();
-    let opponent = match player {
-        SquareState::White => SquareState::Black,
-        SquareState::Black => SquareState::White,
-        SquareState::Empty => SquareState::Empty,
-    };
-
-    for i in 0..BOARD_SIZE {
-        for j in 0..BOARD_SIZE {
-            if board[i][j] != SquareState::Empty {
-                continue;
-            }
-            'cell: for x in -1..=1 {
-                for y in -1..=1 {
-                    if x == 0 && y == 0 {
-                        continue;
-                    }
-                    let mut n: i8 = i as i8 + x;
-                    let mut m: i8 = j as i8 + y;
-                    let mut found_opponent = false;
-
-                    while n >= 0 && n < BOARD_SIZE as i8 && m >= 0 && m < BOARD_SIZE as i8 {
-                        if board[n as usize][m as usize] == opponent {
-                            found_opponent = true;
-                        } else if board[n as usize][m as usize] == player {
-                            if found_opponent {
-                                moves.push((j, i));
-                                break 'cell;
-                            }
-                            break;
-                        } else {
-                            break;
-                        }
-                        n += x;
-                        m += y;
-                    }
-                }
-            }
-        }
+        moves |= shift_mask(candidates, shift, mask) & empty;
     }
 
     moves
 }
 
-pub fn count_pieces(board: &Board, player: SquareState) -> i32 {
-    let mut player_count = 0;
+#[inline(always)]
+fn shift_mask(b: u64, shift: i8, mask: u64) -> u64 {
+    if shift > 0 {
+        (b << shift) & mask
+    } else {
+        (b >> -shift) & mask
+    }
+}
 
-    (0..BOARD_SIZE).for_each(|i| {
-        for sq in &board[i] {
-            if *sq == player {
-                player_count += 1;
+fn get_flips(player: u64, opponent: u64, move_bit: u64) -> u64 {
+    let mut flips = 0u64;
+    let dirs: [(i8, u64); 8] = [
+        (1, !A_FILE),
+        (-1, !H_FILE),
+        (8, !0),
+        (-8, !0),
+        (7, !H_FILE),
+        (-7, !A_FILE),
+        (9, !A_FILE),
+        (-9, !H_FILE),
+    ];
+
+    for (shift, mask) in dirs {
+        let candidates = shift_mask(move_bit, shift, mask) & opponent;
+        if candidates == 0 {
+            continue;
+        }
+        let mut current_ray = candidates;
+        for _ in 0..6 {
+            let next = shift_mask(current_ray, shift, mask);
+            if (next & opponent) != 0 {
+                current_ray |= next;
+            } else {
+                if (next & player) != 0 {
+                    flips |= current_ray;
+                }
+                break;
             }
         }
-    });
+    }
+    flips
+}
 
-    player_count
+pub const BOARD_SIZE: usize = 8;
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn update_board(board: &mut Board, bit_idx: u8, player: SquareState) {
+    let move_bit = 1u64 << bit_idx;
+    let (p, o) = if player == SquareState::Black {
+        (&mut board.black, &mut board.white)
+    } else {
+        (&mut board.white, &mut board.black)
+    };
+    let flips = get_flips(*p, *o, move_bit);
+    *p |= move_bit | flips;
+    *o &= !flips;
+}
+
+pub fn get_valid_moves_mask(board: &Board, player: SquareState) -> u64 {
+    let (p, o) = if player == SquareState::Black {
+        (board.black, board.white)
+    } else {
+        (board.white, board.black)
+    };
+    get_moves(p, o)
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn find_valid_moves(board: &Board, player: SquareState) -> Vec<(usize, usize)> {
+    let moves_mask = get_valid_moves_mask(board, player);
+    let mut moves = Vec::with_capacity(moves_mask.count_ones() as usize);
+    let mut b = moves_mask;
+    while b != 0 {
+        let i = b.trailing_zeros() as usize;
+        moves.push((i % 8, i / 8));
+        b &= b - 1;
+    }
+    moves
+}
+
+pub fn count_pieces(board: &Board, player: SquareState) -> i32 {
+    match player {
+        SquareState::Black => board.black.count_ones() as i32,
+        SquareState::White => board.white.count_ones() as i32,
+        SquareState::Empty => (64 - (board.black | board.white).count_ones()) as i32,
+    }
 }
 
 pub fn render_board(board: &Board) {
@@ -123,28 +175,25 @@ pub fn render_board(board: &Board) {
     print!("{}", termion::cursor::Goto(1, 1));
     print!("{}", termion::clear::CurrentLine);
     print!("  0 1 2 3 4 5 6 7\r\n");
-    (0..BOARD_SIZE).for_each(|i| {
+    for i in 0..BOARD_SIZE {
         print!("{}", termion::clear::CurrentLine);
         print!("{i} ");
-        for sq in &board[i] {
-            let symbol = match sq {
-                SquareState::White => "\u{25cf} ", // black piece
-                SquareState::Black => "\u{25cb} ", // white piece
+        for j in 0..BOARD_SIZE {
+            let symbol = match board.get(j, i) {
+                SquareState::White => "\u{25cf} ", // white piece
+                SquareState::Black => "\u{25cb} ", // black piece
                 SquareState::Empty => "\u{00b7} ", // empty cell
             };
             print!("{symbol}");
         }
         print!("{i}\r\n");
-    });
+    }
     print!("{}", termion::clear::CurrentLine);
     print!("  0 1 2 3 4 5 6 7\r\n");
     io::stdout().flush().unwrap();
 }
 
-// Safety cap on search depth — the time limit will nearly always trigger first
 const MAX_DEPTH: usize = 60;
-
-// Endgame threshold: switch to exact piece-count when this many squares remain empty
 const ENDGAME_EMPTY: i32 = 12;
 
 #[rustfmt::skip]
@@ -166,8 +215,6 @@ pub fn opposite(player: SquareState) -> SquareState {
         SquareState::Empty => SquareState::Empty,
     }
 }
-
-// ---------- Zobrist hashing ----------
 
 struct ZobristTable {
     pieces: [[[u64; 3]; BOARD_SIZE]; BOARD_SIZE],
@@ -202,15 +249,17 @@ fn init_zobrist() -> ZobristTable {
 pub fn compute_hash(board: &Board, player: SquareState) -> u64 {
     let zt = ZOBRIST.get_or_init(init_zobrist);
     let mut hash: u64 = 0;
-    for i in 0..BOARD_SIZE {
-        for j in 0..BOARD_SIZE {
-            let k = match board[i][j] {
-                SquareState::Empty => 0,
-                SquareState::White => 1,
-                SquareState::Black => 2,
-            };
-            hash ^= zt.pieces[i][j][k];
-        }
+    let mut b = board.black;
+    while b != 0 {
+        let i = b.trailing_zeros() as usize;
+        hash ^= zt.pieces[i / 8][i % 8][2];
+        b &= b - 1;
+    }
+    let mut w = board.white;
+    while w != 0 {
+        let i = w.trailing_zeros() as usize;
+        hash ^= zt.pieces[i / 8][i % 8][1];
+        w &= w - 1;
     }
     if player == SquareState::Black {
         hash ^= zt.black_to_move;
@@ -218,14 +267,11 @@ pub fn compute_hash(board: &Board, player: SquareState) -> u64 {
     hash
 }
 
-// ---------- Transposition table ----------
-
-const TT_SIZE: usize = 1 << 20; // ~1M entries, ~16 MB
-
+const TT_SIZE: usize = 1 << 20;
 const TT_NONE: u8 = 0;
 const TT_EXACT: u8 = 1;
-const TT_LOWER: u8 = 2; // fail-high: score >= beta
-const TT_UPPER: u8 = 3; // fail-low:  score <= alpha
+const TT_LOWER: u8 = 2;
+const TT_UPPER: u8 = 3;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -234,8 +280,7 @@ struct TTEntry {
     score: i32,
     flag: u8,
     depth: u8,
-    best_x: u8, // 255 = no move stored
-    best_y: u8,
+    best_move: u8, // 255 = no move stored
 }
 
 impl Default for TTEntry {
@@ -245,8 +290,7 @@ impl Default for TTEntry {
             score: 0,
             flag: TT_NONE,
             depth: 0,
-            best_x: 255,
-            best_y: 255,
+            best_move: 255,
         }
     }
 }
@@ -256,7 +300,6 @@ pub struct TranspositionTable {
     mask: usize,
 }
 
-// Lockless TT: races cause benign torn reads/writes caught by the key check.
 unsafe impl Sync for TranspositionTable {}
 unsafe impl Send for TranspositionTable {}
 
@@ -280,133 +323,125 @@ impl TranspositionTable {
         }
     }
 
-    fn store(&self, hash: u64, depth: u8, score: i32, flag: u8, best: Option<(usize, usize)>) {
+    fn store(&self, hash: u64, depth: u8, score: i32, flag: u8, best_move: Option<u8>) {
         let slot = unsafe { &mut *self.data[hash as usize & self.mask].get() };
-        let (bx, by) = best.map_or((255u8, 255u8), |(x, y)| (x as u8, y as u8));
+        let bm = best_move.unwrap_or(255);
         *slot = TTEntry {
             key: hash,
             score,
             flag,
             depth,
-            best_x: bx,
-            best_y: by,
+            best_move: bm,
         };
     }
 }
 
 static TT: OnceLock<TranspositionTable> = OnceLock::new();
 
-// ---------- Evaluation ----------
-
 pub fn evaluate(board: &Board, player: SquareState) -> i32 {
-    let opp = opposite(player);
-    let mut player_pieces = 0i32;
-    let mut opp_pieces = 0i32;
-    let mut player_pos = 0i32;
-    let mut opp_pos = 0i32;
-    let mut player_frontier = 0i32;
-    let mut opp_frontier = 0i32;
+    let (p_board, o_board) = if player == SquareState::Black {
+        (board.black, board.white)
+    } else {
+        (board.white, board.black)
+    };
 
-    // Single pass: piece counts, positional scores, and frontier discs
-    for i in 0..BOARD_SIZE {
-        for j in 0..BOARD_SIZE {
-            let sq = board[i][j];
-            if sq == SquareState::Empty {
-                continue;
-            }
-            let is_player = sq == player;
-            if is_player {
-                player_pieces += 1;
-                player_pos += POSITION_WEIGHTS[i][j];
-            } else {
-                opp_pieces += 1;
-                opp_pos += POSITION_WEIGHTS[i][j];
-            }
-            'nb: for di in -1i32..=1 {
-                for dj in -1i32..=1 {
-                    if di == 0 && dj == 0 {
-                        continue;
-                    }
-                    let ni = i as i32 + di;
-                    let nj = j as i32 + dj;
-                    if ni >= 0
-                        && ni < BOARD_SIZE as i32
-                        && nj >= 0
-                        && nj < BOARD_SIZE as i32
-                        && board[ni as usize][nj as usize] == SquareState::Empty
-                    {
-                        if is_player {
-                            player_frontier += 1;
-                        } else {
-                            opp_frontier += 1;
-                        }
-                        break 'nb;
-                    }
-                }
-            }
-        }
-    }
+    let p_count = p_board.count_ones() as i32;
+    let o_count = o_board.count_ones() as i32;
+    let empty = 64 - p_count - o_count;
 
-    let empty = (BOARD_SIZE * BOARD_SIZE) as i32 - player_pieces - opp_pieces;
-
-    // Endgame: exact piece count dominates — scaled large to beat any heuristic value
     if empty <= ENDGAME_EMPTY {
-        return (player_pieces - opp_pieces) * 500;
+        return (p_count - o_count) * 500;
     }
 
-    let pos = player_pos - opp_pos;
+    let mut p_pos = 0;
+    let mut o_pos = 0;
+    let mut b = p_board;
+    while b != 0 {
+        let i = b.trailing_zeros() as usize;
+        p_pos += POSITION_WEIGHTS[i / 8][i % 8];
+        b &= b - 1;
+    }
+    let mut b = o_board;
+    while b != 0 {
+        let i = b.trailing_zeros() as usize;
+        o_pos += POSITION_WEIGHTS[i / 8][i % 8];
+        b &= b - 1;
+    }
 
-    // Mobility: having more moves available is a strategic advantage
-    let player_moves = find_valid_moves(board, player).len() as i32;
-    let opp_moves = find_valid_moves(board, opp).len() as i32;
-    let mobility = player_moves - opp_moves;
+    let p_moves = get_moves(p_board, o_board).count_ones() as i32;
+    let o_moves = get_moves(o_board, p_board).count_ones() as i32;
+    let mobility = p_moves - o_moves;
 
-    // Frontier: fewer exposed discs = more stable position
-    let frontier = player_frontier - opp_frontier;
+    let empty_mask = !(p_board | o_board);
+    let p_frontier = count_frontier(p_board, empty_mask);
+    let o_frontier = count_frontier(o_board, empty_mask);
+    let frontier = p_frontier - o_frontier;
 
-    pos + mobility * 10 - frontier * 3
+    (p_pos - o_pos) + mobility * 10 - frontier * 3
 }
 
-// Move ordering reuses the positional table: corners first, X-squares last
-fn move_priority(mov: (usize, usize)) -> i32 {
-    POSITION_WEIGHTS[mov.1][mov.0]
+fn count_frontier(board: u64, empty: u64) -> i32 {
+    let mut frontier = 0;
+    let dirs: [(i8, u64); 8] = [
+        (1, !A_FILE),
+        (-1, !H_FILE),
+        (8, !0),
+        (-8, !0),
+        (7, !H_FILE),
+        (-7, !A_FILE),
+        (9, !A_FILE),
+        (-9, !H_FILE),
+    ];
+    for (shift, mask) in dirs {
+        frontier |= shift_mask(board, shift, mask) & empty;
+    }
+    frontier.count_ones() as i32
+}
+
+fn move_priority(bit_idx: u8) -> i32 {
+    POSITION_WEIGHTS[bit_idx as usize / 8][bit_idx as usize % 8]
 }
 
 pub fn find_best_move(
     board: &Board,
     player: SquareState,
-    mut moves: Vec<(usize, usize)>,
+    _moves_vec: Vec<(usize, usize)>,
     time_limit: Duration,
 ) -> ((usize, usize), usize) {
-    moves.sort_by_key(|&m| -move_priority(m));
+    let moves_mask = get_valid_moves_mask(board, player);
+    if moves_mask == 0 {
+        return ((0, 0), 0);
+    }
 
     let abort = Arc::new(AtomicBool::new(false));
-
-    // Timer thread: fires the abort flag after time_limit
     let abort_timer = Arc::clone(&abort);
     std::thread::spawn(move || {
         std::thread::sleep(time_limit);
         abort_timer.store(true, Ordering::Relaxed);
     });
 
-    let mut best_move = moves[0];
+    let mut best_move_idx = moves_mask.trailing_zeros() as u8;
     let mut completed_depth = 0usize;
-    // Tracks move order; re-sorted after each depth using scores from the previous
-    // search (principal-variation ordering — improves alpha-beta cut rate at the next depth)
-    let mut ordered = moves.clone();
     let tt = TT.get_or_init(|| TranspositionTable::new(TT_SIZE));
+
+    let mut ordered: Vec<u8> = Vec::new();
+    let mut b = moves_mask;
+    while b != 0 {
+        ordered.push(b.trailing_zeros() as u8);
+        b &= b - 1;
+    }
+    ordered.sort_by_key(|&m| -move_priority(m));
 
     for depth in 1..=MAX_DEPTH {
         if abort.load(Ordering::Relaxed) {
             break;
         }
-
         let abort_ref: &AtomicBool = &abort;
-        let results: Vec<(usize, usize, i32)> = ordered
+        let results: Vec<(u8, i32)> = ordered
             .par_iter()
-            .map(|&mov| {
+            .map(|&m| {
                 let mut b = board.to_owned();
-                update_board(&mut b, mov.0, mov.1, player);
+                update_board(&mut b, m, player);
                 let score = -negamax(
                     &b,
                     opposite(player),
@@ -416,35 +451,31 @@ pub fn find_best_move(
                     abort_ref,
                     tt,
                 );
-                (mov.0, mov.1, score)
+                (m, score)
             })
             .collect();
 
-        // Discard results from an interrupted depth — use last fully-completed result
         if abort.load(Ordering::Relaxed) {
             break;
         }
-
-        if let Some(&(x, y, _)) = results.iter().max_by_key(|&&(_, _, s)| s) {
-            best_move = (x, y);
+        if let Some(&(m, _)) = results.iter().max_by_key(|&&(_, s)| s) {
+            best_move_idx = m;
         }
         completed_depth = depth;
-
-        // Re-order moves by descending score for the next depth
-        ordered.sort_by_key(|&mov| {
+        ordered.sort_by_key(|&m| {
             -results
                 .iter()
-                .find(|&&(x, y, _)| (x, y) == mov)
-                .map_or(0, |&(_, _, s)| s)
+                .find(|&&(rm, _)| rm == m)
+                .map_or(0, |&(_, s)| s)
         });
-
-        // Early exit: if we've solved the position exactly, no deeper search needed
-        if results.iter().any(|&(_, _, s)| s.abs() >= 5_000) {
+        if results.iter().any(|&(_, s)| s.abs() >= 5_000) {
             break;
         }
     }
-
-    (best_move, completed_depth)
+    (
+        (best_move_idx as usize % 8, best_move_idx as usize / 8),
+        completed_depth,
+    )
 }
 
 pub fn negamax(
@@ -457,17 +488,16 @@ pub fn negamax(
     tt: &TranspositionTable,
 ) -> i32 {
     if abort.load(Ordering::Relaxed) {
-        return 0; // value will be discarded by find_best_move
+        return 0;
     }
-
     let hash = compute_hash(board, player);
     let orig_alpha = alpha;
     let mut alpha = alpha;
-    let mut tt_best: Option<(usize, usize)> = None;
+    let mut tt_best: Option<u8> = None;
 
     if let Some(entry) = tt.probe(hash) {
-        if entry.best_x < BOARD_SIZE as u8 {
-            tt_best = Some((entry.best_x as usize, entry.best_y as usize));
+        if entry.best_move < 64 {
+            tt_best = Some(entry.best_move);
         }
         if entry.depth >= depth as u8 {
             let s = entry.score;
@@ -495,21 +525,24 @@ pub fn negamax(
         return score;
     }
 
-    let mut moves = find_valid_moves(board, player);
-    if moves.is_empty() {
-        let opp_moves = find_valid_moves(board, opposite(player));
-        if opp_moves.is_empty() {
-            // game over — exact result, scaled to dominate any heuristic score
+    let moves_mask = get_valid_moves_mask(board, player);
+    if moves_mask == 0 {
+        let opp_mask = get_valid_moves_mask(board, opposite(player));
+        if opp_mask == 0 {
             let score =
                 (count_pieces(board, player) - count_pieces(board, opposite(player))) * 10_000;
             tt.store(hash, 255, score, TT_EXACT, None);
             return score;
         }
-        // forced pass — position didn't advance, so don't decrement depth
         return -negamax(board, opposite(player), depth, -beta, -alpha, abort, tt);
     }
 
-    // TT hash move first, then positional weights
+    let mut moves: Vec<u8> = Vec::new();
+    let mut b = moves_mask;
+    while b != 0 {
+        moves.push(b.trailing_zeros() as u8);
+        b &= b - 1;
+    }
     moves.sort_by_key(|&m| {
         if Some(m) == tt_best {
             i32::MIN
@@ -520,22 +553,22 @@ pub fn negamax(
 
     let mut best = i32::MIN + 1;
     let mut best_move = moves[0];
-    for &mov in &moves {
+    for &m in &moves {
         let mut b = board.to_owned();
-        update_board(&mut b, mov.0, mov.1, player);
+        update_board(&mut b, m, player);
         let score = -negamax(&b, opposite(player), depth - 1, -beta, -alpha, abort, tt);
         if abort.load(Ordering::Relaxed) {
-            return 0; // don't store aborted results
+            return 0;
         }
         if score > best {
             best = score;
-            best_move = mov;
+            best_move = m;
         }
         if score > alpha {
             alpha = score;
         }
         if alpha >= beta {
-            break; // beta cut-off
+            break;
         }
     }
 
@@ -547,7 +580,6 @@ pub fn negamax(
         TT_UPPER
     };
     tt.store(hash, depth as u8, best, flag, Some(best_move));
-
     best
 }
 
@@ -556,13 +588,11 @@ pub fn get_user_move(moves: &[(usize, usize)]) -> Option<(usize, usize)> {
         '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i',
         'o', 'p', 'a', 's', 'd', 'f',
     ];
-
     for (i, mov) in moves.iter().enumerate().take(labels.len()) {
         print!("{}", termion::clear::CurrentLine);
         print!("{}: ({}, {})  \r\n", labels[i], mov.0, mov.1);
     }
     stdout().flush().unwrap();
-
     loop {
         for event in stdin().events() {
             let Ok(event) = event else { continue };
@@ -577,5 +607,29 @@ pub fn get_user_move(moves: &[(usize, usize)]) -> Option<(usize, usize)> {
                 return None;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_initial_moves() {
+        let board = Board::new();
+        let moves_mask = get_valid_moves_mask(&board, SquareState::Black);
+        let expected_mask = (1u64 << 26) | (1u64 << 19) | (1u64 << 44) | (1u64 << 37);
+        assert_eq!(moves_mask, expected_mask);
+    }
+
+    #[test]
+    fn test_initial_flip() {
+        let mut board = Board::new();
+        update_board(&mut board, 26, SquareState::Black);
+        assert_eq!(board.get(3, 3), SquareState::Black);
+        assert_eq!(board.get(2, 3), SquareState::Black);
+        assert_eq!(board.get(3, 4), SquareState::Black);
+        assert_eq!(board.get(4, 3), SquareState::Black);
+        assert_eq!(board.get(4, 4), SquareState::White);
     }
 }

@@ -9,13 +9,7 @@ fn main() {
     print!("{}", termion::clear::All);
     let _raw = stdout().into_raw_mode().unwrap();
 
-    let mut board: Board = [[SquareState::Empty; BOARD_SIZE]; BOARD_SIZE];
-
-    // Set up initial state
-    board[3][3] = SquareState::White;
-    board[3][4] = SquareState::Black;
-    board[4][3] = SquareState::Black;
-    board[4][4] = SquareState::White;
+    let mut board = Board::new();
 
     render_board(&board);
     let mut current_player = SquareState::White;
@@ -49,7 +43,11 @@ fn main() {
             SquareState::Empty => ((0, 0), 0),
         };
 
-        update_board(&mut board, next_move.0, next_move.1, current_player);
+        update_board(
+            &mut board,
+            (next_move.1 * 8 + next_move.0) as u8,
+            current_player,
+        );
         render_board(&board);
         if current_player == SquareState::Black && ai_depth > 0 {
             print!("AI searched to depth {ai_depth}\r\n");
